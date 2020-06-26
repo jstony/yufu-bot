@@ -52,6 +52,7 @@ class BybitGridBot(object):
 
         # 机器人配置
         self.enabled = False
+        self.test_net = False
         self._grids = []
         self._robot_id = -1
         self._username = ""
@@ -63,6 +64,8 @@ class BybitGridBot(object):
         self._asset_id = -1
         self._position_id = -1
         self._synced_order_set = set()
+        self._ignored_order_set = set()
+        self._order_sync_ts = None
         self._grid_id_index_map = {}
         now = self.timestamp_millisecond()
         self._timestamp_markers = {
@@ -92,6 +95,11 @@ class BybitGridBot(object):
         self._secret = result["credential_keys"]["secret"]
         self._username = result["user"]["username"]
         self._exchange_name_zh = result["exchange"]["name_zh"]
+        self.test_net = result["test_net"]
+        if self._order_sync_ts is None:
+            self._order_sync_ts = (
+                result["order_sync_ts"] or self.timestamp_millisecond()
+            )
 
     async def load_grids(self):
         grids = await self.http_client.fetch_grids()
@@ -141,6 +149,26 @@ class BybitGridBot(object):
 
             if grid_id == int(cid.split("-", 1)[0]):
                 return order
+
+    async def _preload_ignored_orders(self):
+        orders = await self.ccxt_exchange.fetch_closed_orders(
+            symbol=self._ccxt_symbol, limit=50, params={"order_status": "Filled"},
+        )
+        orders = sorted(orders, key=lambda x: x["timestamp"])
+        grid_orders = self._filter_grid_orders(orders)
+        for order in grid_orders:
+            # fixme 机器人启动前的订单，跳过
+            if (
+                self.ccxt_exchange.parse8601(order["info"]["updated_at"])
+                < self._order_sync_ts
+            ):
+                local_logger.info(
+                    "忽略已同步的订单（id: %s, cid: %s）",
+                    order["id"],
+                    order["info"]["order_link_id"],
+                )
+                self._ignored_order_set.add(order["id"])
+                continue
 
     def _filter_grid_orders(self, orders):
         grid_orders = []
@@ -237,17 +265,7 @@ class BybitGridBot(object):
             if order["id"] in self._synced_order_set:
                 continue
 
-            # fixme 机器人启动前的订单，跳过
-            if (
-                self.ccxt_exchange.parse8601(order["info"]["updated_at"])
-                < self._timestamp_markers["start"]
-            ):
-                local_logger.info(
-                    "跳过机器人启动前的订单（id: %s, cid: %s）",
-                    order["id"],
-                    order["info"]["order_link_id"],
-                )
-                self._synced_order_set.add(order["id"])
+            if order["id"] in self._ignored_order_set:
                 continue
 
             cid: str = order["info"]["order_link_id"]
@@ -255,7 +273,7 @@ class BybitGridBot(object):
             grid_index = self._grid_id_index_map.get(grid_id, -1)
             if grid_index < 0:
                 local_logger.info("未找到 %s 订单关联的网格", cid)
-                self._synced_order_set.add(order["id"])
+                self._ignored_order_set.add(order["id"])
                 continue
 
             grid = self._grids[grid_index]
@@ -290,11 +308,17 @@ class BybitGridBot(object):
                 updated_grids.append(grid)
 
             self._synced_order_set.add(order["id"])
-            remote_logger.info("已同步 %d 个订单", len(self._synced_order_set))
+            remote_logger.info("已同步 %d 个网格订单", len(self._synced_order_set))
 
         if len(updated_grids) > 0:
             # fixme 失败重传，否则可能导致网格状态不一致
             await self.http_client.update_grids(updated_grids)
+            # Todo: 优化为消息队列，减少阻塞
+            await self.ws_client.send_grids(updated_grids)
+
+        # Todo: 优化回传频率
+        self._order_sync_ts = self.timestamp_millisecond()
+        await self.http_client.update_robot(data={"order_sync_ts": self._order_sync_ts})
 
     async def get_last_price(self):
         ticker = await self.ccxt_exchange.fetch_ticker(symbol=self._ccxt_symbol)
@@ -310,9 +334,9 @@ class BybitGridBot(object):
         return best_ask, best_bid
 
     async def pre_trade(self):
-        if settings.TEST_NET:
-            self.enable_test_net()
         await self.sync_config()
+        if self.test_net:
+            self.enable_test_net()
         self.auth()
         await self.ccxt_exchange.load_markets()
         tasks = [
@@ -320,19 +344,18 @@ class BybitGridBot(object):
             self.sync_position(),
             self.sync_balance(),
             self.load_grids(),
+            self._preload_ignored_orders(),
         ]
         await asyncio.gather(*tasks)
 
-    async def wait_for_open(self):
+    async def wait_enable(self):
         """
         等待机器人开启
         """
-        while True:
-            if self.enabled:
-                break
-
+        while not self.enabled:
             remote_logger.info("机器人处于关闭状态...")
-            await asyncio.sleep(20)
+            await self.ccxt_exchange.cancel_all_orders(symbol=self._ccxt_symbol)
+            await asyncio.sleep(5)
             await self.sync_config()
 
     async def trade(self):
@@ -342,7 +365,8 @@ class BybitGridBot(object):
         while True:
             try:
                 local_logger.info("检测轮次: %d", cnt)
-                await self.wait_for_open()
+                await self.sync_config()
+                await self.wait_enable()
                 await asyncio.gather(
                     self.sync_position(), self.sync_balance(), self.sync_grids()
                 )
@@ -351,6 +375,7 @@ class BybitGridBot(object):
                 cnt += 1
             except Exception as e:
                 notifier_logger.exception(e, exc_info=True)
+                time.sleep(settings.TRADE_INTERVAL)
 
     def auth(self):
         self.ccxt_exchange.apiKey = self._api_key
@@ -366,6 +391,7 @@ class BybitGridBot(object):
             "leverage": self.pos["leverage"],
         }
         await self.http_client.update_position(data)
+        await self.ws_client.send_position(data=data)
 
     async def feedback_asset(self):
         await self.http_client.update_asset({"balance": self.balance})
@@ -374,6 +400,9 @@ class BybitGridBot(object):
         while True:
             try:
                 await self.http_client.ping()
+                await self.ws_client.send_ping(
+                    data={"timestamp": self.timestamp_millisecond()}
+                )
                 local_logger.debug("Ping to server")
             except Exception as e:
                 # fixme 更加细致的异常处理
@@ -392,6 +421,7 @@ class BybitGridBot(object):
 
     async def start(self):
         # fixme: more elegant way
+        await self.ws_client.start()
         await self.sync_config()
         await asyncio.gather(self.trade(), self.ping_task(), self.feedback_task())
 

@@ -25,6 +25,7 @@ class FisherRobotStreamWebsocketClient(object):
             + settings.ROBOT_STREAM_KEY
         )
         self.ws = None
+        self._task = None
 
     def get_connect_kwargs(self):
         return self.connect_kwargs
@@ -32,9 +33,10 @@ class FisherRobotStreamWebsocketClient(object):
     async def connect(self):
         connect_kwargs = self.get_connect_kwargs()
         self.ws = await websockets.connect(self.ws_uri, **connect_kwargs)
-        local_logger.info("Connected!", self.ws_uri)
+        local_logger.info("Connected!")
 
     async def send(self, s):
+        # fixme: 处理断线重连
         await self.ws.send(s)
         local_logger.debug(">>> %s", s)
 
@@ -46,9 +48,19 @@ class FisherRobotStreamWebsocketClient(object):
         message = {"topic": "asset", "data": data}
         await self.send(self.encode(message))
 
-    async def send_ping(self, data):
-        message = {"topic": "ping", "data": {}}
+    async def send_grids(self, data):
+        message = {"topic": "grid", "data": data}
         await self.send(self.encode(message))
+
+    async def send_ping(self, data):
+        message = {"topic": "ping", "data": data}
+        await self.send(self.encode(message))
+
+    async def start(self):
+        await self.connect()
+
+    async def stop(self):
+        await self.ws.close()
 
     @staticmethod
     def encode(message):

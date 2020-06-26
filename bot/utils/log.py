@@ -3,10 +3,11 @@ import json
 import logging
 import logging.config
 import time
-from asyncio.queues import Queue as AsyncioQueue, QueueEmpty
-from queue import Queue
+from asyncio.queues import Queue as AsyncioQueue
+from asyncio.queues import QueueEmpty
 from logging.handlers import QueueListener
 from pathlib import Path
+from queue import Queue
 from typing import Optional
 
 import websockets
@@ -167,6 +168,7 @@ class FisherRobotStreamWebsocketHandler(WebsocketHandler):
     def map_log_record(self, record):
         return {
             "topic": "log",
+            "level": record.levelname,
             "timestamp": int(record.created * 1000),
             "msg": record.msg,
         }
