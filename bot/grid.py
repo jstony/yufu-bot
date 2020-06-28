@@ -5,6 +5,7 @@ import string
 import time
 from datetime import datetime
 
+import httpx
 from ccxt import async_support as ccxt
 
 from bot import settings
@@ -66,6 +67,7 @@ class BybitGridBot(object):
         self._synced_order_set = set()
         self._ignored_order_set = set()
         self._order_sync_ts = None
+        self._parameter_modified_ts = None
         self._grid_id_index_map = {}
         now = self.timestamp_millisecond()
         self._timestamp_markers = {
@@ -278,14 +280,11 @@ class BybitGridBot(object):
 
             grid = self._grids[grid_index]
             if order["side"] == "sell":
-                grid["filled_qty"] = order["cost"]
+                grid["filled_qty"] = order["info"]["qty"]
                 grid["holding"] = True
                 notifier_logger.info(
-                    "网格（层%s, 入%.2f, 出%.2f, 量%d）开，关联订单：%s %d@%.2f",
-                    grid["index"],
-                    grid["entry_price"],
-                    grid["exit_price"],
-                    grid["entry_qty"],
+                    "网格<%d>开, 关联订单：%s %d@%.2f",
+                    grid["level"],
                     order["side"],
                     order["amount"],
                     order["price"],
@@ -296,11 +295,8 @@ class BybitGridBot(object):
                 grid["filled_qty"] = 0
                 grid["holding"] = False
                 notifier_logger.info(
-                    "网格（层%s, 入%.2f, 出%.2f, 量%d）平，关联订单：%s %d@%.2f",
-                    grid["index"],
-                    grid["entry_price"],
-                    grid["exit_price"],
-                    grid["entry_qty"],
+                    "网格<%d>平, 关联订单：%s %d@%.2f",
+                    grid["level"],
                     order["side"],
                     order["amount"],
                     order["price"],
@@ -314,7 +310,7 @@ class BybitGridBot(object):
             # fixme 失败重传，否则可能导致网格状态不一致
             await self.http_client.update_grids(updated_grids)
             # Todo: 优化为消息队列，减少阻塞
-            await self.ws_client.send_grids(updated_grids)
+            await self.ws_client.send_grids(self._grids)
 
         # Todo: 优化回传频率
         self._order_sync_ts = self.timestamp_millisecond()
@@ -335,6 +331,14 @@ class BybitGridBot(object):
 
     async def pre_trade(self):
         await self.sync_config()
+        try:
+            parameter = await self.http_client.fetch_grid_strategy_parameter()
+            self._parameter_modified_ts = self.ccxt_exchange.parse8601(
+                parameter["modified_at"]
+            )
+        except httpx.HTTPError:
+            remote_logger.warning("未设置网格策略参数")
+            raise
         if self.test_net:
             self.enable_test_net()
         self.auth()
@@ -354,8 +358,9 @@ class BybitGridBot(object):
         """
         while not self.enabled:
             remote_logger.info("机器人处于关闭状态...")
+            # fixme: 频繁取消将触发交易所限流
             await self.ccxt_exchange.cancel_all_orders(symbol=self._ccxt_symbol)
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
             await self.sync_config()
 
     async def trade(self):
@@ -364,9 +369,25 @@ class BybitGridBot(object):
         cnt = 1
         while True:
             try:
-                local_logger.info("检测轮次: %d", cnt)
+                remote_logger.info("检测轮次: %d", cnt)
                 await self.sync_config()
+                try:
+                    parameter = await self.http_client.fetch_grid_strategy_parameter()
+                except httpx.HTTPError:
+                    remote_logger.warning("未设置网格策略参数")
+                    await self.ccxt_exchange.cancel_all_orders(symbol=self._ccxt_symbol)
+                    await asyncio.sleep(30)
+                    continue
+
                 await self.wait_enable()
+                parameter_modified_ts = self.ccxt_exchange.parse8601(
+                    parameter["modified_at"]
+                )
+                if parameter_modified_ts > self._parameter_modified_ts:
+                    remote_logger.warning("网格参数变更, 同步新的网格状态")
+                    await self.load_grids()
+                    self._parameter_modified_ts = parameter_modified_ts
+
                 await asyncio.gather(
                     self.sync_position(), self.sync_balance(), self.sync_grids()
                 )

@@ -1,5 +1,6 @@
 GRIDS_REQ_PATH = "/grids/"
 ROBOT_GRIDS_REQ_PATH = "/robots/{pk}/grids/"
+ROBOT_GRID_STRATEGY_PARAMETER_REQ_PATH = "/robots/{pk}/grid-strategy-parameter/"
 ROBOT_LOG_REQ_PATH = "/robots/logs/"
 ROBOT_CONFIG_REQ_PATH = "/robots/{pk}/config/"
 ROBOT_REQ_PATH = "/robots/{pk}/"

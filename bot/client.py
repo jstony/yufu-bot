@@ -77,6 +77,13 @@ class FisherHttpClient(object):
     def __init__(self):
         self.base_url: str = settings.SERVER_BASE_URL.rstrip("/")
 
+    async def fetch_grid_strategy_parameter(self):
+        """获取网格数据"""
+        parameter = await self._request(
+            "GET", c.ROBOT_GRID_STRATEGY_PARAMETER_REQ_PATH.format(pk=settings.ROBOT_ID)
+        )
+        return parameter
+
     async def fetch_grids(self):
         """获取网格数据"""
         grids = await self._request(
