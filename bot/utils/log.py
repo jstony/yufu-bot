@@ -18,6 +18,10 @@ from dingtalkchatbot.chatbot import DingtalkChatbot
 
 
 class DingTalkHandler(logging.Handler):
+    """
+    将日志推送钉钉的 Handler
+    """
+
     def __init__(self, webhook, secret, level=logging.NOTSET):
         super().__init__(level=level)
         self.ding_bot = DingtalkChatbot(webhook, secret=secret)

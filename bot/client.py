@@ -37,6 +37,8 @@ class FisherRobotStreamWebsocketClient(object):
 
     async def send(self, s):
         # fixme: 处理断线重连
+        if self.ws.closed:
+            await self.connect()
         await self.ws.send(s)
         local_logger.debug(">>> %s", s)
 
