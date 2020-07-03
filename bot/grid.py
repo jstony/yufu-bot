@@ -109,12 +109,92 @@ class BybitGridBot(object):
         for i, grid in enumerate(grids):
             self._grid_id_index_map[grid["id"]] = i
 
+    def check_order(self, real, expected):
+        return True
+
+    ##############################
+    # 订单管理
+    ##############################
+    async def ensure_order(self):
+        open_orders = await self.fetch_open_orders()
+        ask0, bid0 = await self.get_best_price()
+        order_args_list = []
+        cancel_order_ids = []
+        for grid in self._grids:
+            grid_id = grid["id"]
+            order = self._find_grid_order(open_orders, grid_id)
+            if order is not None:
+                # Todo: 检查订单参数，不符则取消重挂
+                expected = {}
+                if not self.check_order(real=order, expected=expected):
+                    cancel_order_ids.append(order["id"])
+                    order_args_list.append(expected)
+                continue
+
+            if grid["associated_order_id"] != "" and self._find_order_by_id(
+                open_orders, grid["associated_order_id"]
+            ):
+                # 已挂单
+                continue
+
+            if grid["holding"]:
+                order_args = {
+                    "order_dir": 1,
+                    "qty": grid["entry_qty"],
+                    "price": min(grid["exit_price"], ask0 - 0.5, self.pos["avg_price"]),
+                }
+            else:
+                # 如果卖出价比最优买价还要低，暂时不卖
+                if grid["entry_price"] <= bid0:
+                    continue
+
+                order_args = {
+                    "order_dir": -1,
+                    "qty": grid["entry_qty"],
+                    "price": grid["entry_price"],
+                }
+            suffix = self._get_random_string(k=10)
+            order_args["cid"] = f"{self.order_cid_prefix}{grid_id}-{suffix}"
+            order_args_list.append(order_args)
+
+        if len(cancel_order_ids) > 0:
+            # Todo: 取消不符的挂单，要注意相关的异常处理
+            pass
+
+        placed_orders = []
+        for chunk in self.chunks(order_args_list, 10):
+            result = await self.place_orders_batch(chunk)
+            placed_orders.extend(result)
+        await self._sync_grids_associated_order_id(placed_orders)
+
+    @staticmethod
+    def chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i : i + n]
+
+    async def _sync_grids_associated_order_id(self, orders):
+        for order in orders:
+            cid = order["info"]["order_link_id"]
+            cid = cid.strip(self.order_cid_prefix)
+            grid_id = int(cid.split("-", 1)[0])
+            grid_index = self._grid_id_index_map[grid_id]
+            grid = self._grids[grid_index]
+            grid["associated_order_id"] = order["id"]
+        await self.http_client.update_grids(self._grids)
+
+    async def place_orders_batch(self, orders):
+        tasks = []
+        for order_args in orders:
+            tasks.append(self.place_order(**order_args))
+        result_set = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in result_set if not isinstance(r, Exception)]
+
     async def place_order(self, *, order_dir, qty, price, cid=""):
         dir_mapping = {
             -1: "sell",
             1: "buy",
         }
-        await self.ccxt_exchange.create_order(
+        res = await self.ccxt_exchange.create_order(
             symbol=self._ccxt_symbol,
             type="limit",
             side=dir_mapping[order_dir],
@@ -122,16 +202,15 @@ class BybitGridBot(object):
             price=price,
             params={"time_in_force": "PostOnly", "order_link_id": cid},
         )
+        return res
 
     def enable_test_net(self):
         self.ccxt_exchange.set_sandbox_mode(enabled=True)
 
-    async def place_orders_batch(self, orders):
-        tasks = []
-        for order_args in orders:
-            tasks.append(self.place_order(**order_args))
-        # Todo: 处理异常
-        await asyncio.gather(*tasks)
+    def _find_order_by_id(self, orders, order_id):
+        for order in orders:
+            if order["id"] == order_id:
+                return order
 
     def _find_grid_order(self, orders, grid_id):
         for order in orders:
@@ -183,38 +262,15 @@ class BybitGridBot(object):
                 not_grid_orders.append(order)
         return grid_orders
 
-    async def ensure_order(self):
-        last_price = await self.get_last_price()
-        bid, ask = await self.get_best_price()
+    async def fetch_open_orders(self):
+        """
+        类似于 ccxt 的 fetch_open_orders，但是考虑了分页的情况，返回不同分页下的全部挂单
+        """
+        # Todo: 挂单分页的情况
         open_orders = await self.ccxt_exchange.fetch_open_orders(
             symbol=self._ccxt_symbol, limit=50
         )
-        order_args_list = []
-        for grid in reversed(self._grids):
-            grid_id = grid["id"]
-            if self._find_grid_order(open_orders, grid_id):
-                continue
-
-            if grid["holding"]:
-                order_args = {
-                    "order_dir": 1,
-                    "qty": grid["entry_qty"],
-                    "price": min(grid["exit_price"], ask - 0.5, self.pos["avg_price"]),
-                }
-            else:
-                if grid["entry_price"] <= last_price:
-                    continue
-
-                order_args = {
-                    "order_dir": -1,
-                    "qty": grid["entry_qty"],
-                    "price": grid["entry_price"],
-                }
-            suffix = self._get_random_string(k=10)
-            order_args["cid"] = f"{self.order_cid_prefix}{grid_id}-{suffix}"
-            order_args_list.append(order_args)
-
-        await self.place_orders_batch(order_args_list)
+        return open_orders
 
     async def sync_balance(self):
         result = await self.ccxt_exchange.fetch_balance()
@@ -282,6 +338,7 @@ class BybitGridBot(object):
             if order["side"] == "sell":
                 grid["filled_qty"] = order["info"]["qty"]
                 grid["holding"] = True
+                grid["associated_order_id"] = ""
                 notifier_logger.info(
                     "网格<%d>开, 关联订单：%s %d@%.2f",
                     grid["level"],
@@ -294,6 +351,7 @@ class BybitGridBot(object):
             if order["side"] == "buy":
                 grid["filled_qty"] = 0
                 grid["holding"] = False
+                grid["associated_order_id"] = ""
                 notifier_logger.info(
                     "网格<%d>平, 关联订单：%s %d@%.2f",
                     grid["level"],
@@ -325,8 +383,8 @@ class BybitGridBot(object):
         order_book = await self.ccxt_exchange.fetch_l2_order_book(
             symbol=self._ccxt_symbol, limit=5
         )
-        best_bid = order_book["bids"][0][0]
         best_ask = order_book["asks"][0][0]
+        best_bid = order_book["bids"][0][0]
         return best_ask, best_bid
 
     async def pre_trade(self):

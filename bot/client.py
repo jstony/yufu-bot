@@ -18,12 +18,7 @@ class FisherRobotStreamWebsocketClient(object):
     }
 
     def __init__(self):
-        self.ws_uri = (
-            settings.ROBOT_STREAM_WS_URI
-            + "?"
-            + "stream_key="
-            + settings.ROBOT_STREAM_KEY
-        )
+        self.ws_uri = settings.WS_ROBOT_STREAM_URI
         self.ws = None
         self._task = None
 
@@ -77,7 +72,7 @@ class FisherHttpClient(object):
     headers = {"Authorization": f"Token {settings.TOKEN}"}
 
     def __init__(self):
-        self.base_url: str = settings.SERVER_BASE_URL.rstrip("/")
+        self.base_url: str = settings.REST_BASE_URL.rstrip("/")
 
     async def fetch_grid_strategy_parameter(self):
         """获取网格数据"""
